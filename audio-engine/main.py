@@ -3,7 +3,7 @@ import numpy as np
 import soundfile as sf
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
-from pedalboard import Pedalboard, Delay, Reverb, Gain, PeakFilter, Distortion, Compressor, Clipping
+from pedalboard import Pedalboard, Delay, Reverb, Gain, PeakFilter, Distortion, Compressor, Clipping, PitchShift, LowpassFilter, Chorus
 from pedalboard.io import AudioFile
 
 app = FastAPI(title="Pro Bass FX Engine")
@@ -11,6 +11,9 @@ app = FastAPI(title="Pro Bass FX Engine")
 @app.post("/process")
 async def process_audio(
         file: UploadFile = File(...),
+        pitch_shift: float = 0.0,
+        chorus_depth: float = 0.0,
+        lp_cutoff: float = 20000.0,
         fuzz_drive: float = 0.0,
         eq_40: float = 0.0, eq_80: float = 0.0, eq_160: float = 0.0, eq_320: float = 0.0,
         eq_640: float = 0.0, eq_1280: float = 0.0, eq_2560: float = 0.0, eq_5120: float = 0.0,
@@ -26,11 +29,14 @@ async def process_audio(
         sample_rate = f.samplerate
         audio_in = f.read(f.frames)
 
-    # Adăugăm 2 secunde la final pt delay
-    silence_padding = np.zeros((audio_in.shape[0], int(sample_rate * 2)))
-    audio_with_tail = np.concatenate([audio_in, silence_padding], axis=1)
+    # Buffer Management: Padding pentru tail processing (delay/reverb)
+    silence = np.zeros((audio_in.shape[0], int(sample_rate * 2.5)))
+    audio_buffer = np.concatenate([audio_in, silence], axis=1)
 
     board = Pedalboard([
+        PitchShift(semitones=pitch_shift),
+        Chorus(depth=chorus_depth) if chorus_depth > 0 else Gain(0),
+        LowpassFilter(cutoff_frequency_hz=lp_cutoff), # Corectat aici (p mic)
         Distortion(drive_db=fuzz_drive) if fuzz_drive > 0 else Gain(0),
         PeakFilter(cutoff_frequency_hz=40, gain_db=eq_40),
         PeakFilter(cutoff_frequency_hz=80, gain_db=eq_80),
@@ -41,14 +47,13 @@ async def process_audio(
         PeakFilter(cutoff_frequency_hz=2560, gain_db=eq_2560),
         PeakFilter(cutoff_frequency_hz=5120, gain_db=eq_5120),
         Compressor(threshold_db=comp_threshold, ratio=comp_ratio),
-        # 'mix' în pedalboard: 0.0 = dry, 1.0 = wet. 0.3-0.5 e ideal pentru ecou
         Delay(delay_seconds=delay_time, feedback=delay_feedback, mix=delay_level),
         Reverb(room_size=reverb_room, wet_level=reverb_wet),
         Clipping(threshold_db=clip_threshold),
         Gain(gain_db=master_gain),
     ])
 
-    audio_out = board(audio_with_tail, sample_rate)
+    audio_out = board(audio_buffer, sample_rate)
 
     buf = io.BytesIO()
     sf.write(buf, audio_out.T, sample_rate, format="WAV", subtype="PCM_16")

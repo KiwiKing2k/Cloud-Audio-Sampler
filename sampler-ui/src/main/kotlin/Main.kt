@@ -25,12 +25,16 @@ import java.nio.file.Files
 import kotlin.math.cos
 import kotlin.math.sin
 import javax.sound.sampled.AudioSystem
+import javax.sound.sampled.Clip
 import javax.swing.JFileChooser
 import javax.swing.filechooser.FileNameExtensionFilter
 
 val httpClient = HttpClient(CIO)
 
 data class FXParams(
+    val pitch: Float = 0f,
+    val lpFilter: Float = 20000f,
+    val chorus: Float = 0f,
     val fuzz: Float = 0f,
     val eq: List<Float> = List(8) { 0f },
     val compThreshold: Float = 0f, val compRatio: Float = 1f,
@@ -41,6 +45,9 @@ data class FXParams(
 
 suspend fun fetchProcessedAudio(file: File, p: FXParams): ByteArray = withContext(Dispatchers.IO) {
     val response: HttpResponse = httpClient.post("http://127.0.0.1:8000/process") {
+        parameter("pitch_shift", p.pitch)
+        parameter("lp_cutoff", p.lpFilter)
+        parameter("chorus_depth", p.chorus)
         parameter("fuzz_drive", p.fuzz)
         p.eq.forEachIndexed { i, v -> parameter("eq_${listOf(40,80,160,320,640,1280,2560,5120)[i]}", v) }
         parameter("comp_threshold", p.compThreshold); parameter("comp_ratio", p.compRatio)
@@ -57,13 +64,36 @@ suspend fun fetchProcessedAudio(file: File, p: FXParams): ByteArray = withContex
     response.readRawBytes()
 }
 
-fun playWavBytes(bytes: ByteArray) {
+var currentClip: Clip? = null
+
+fun playWavBytes(bytes: ByteArray, onProgress: (Float, Float) -> Unit, onComplete: () -> Unit) {
     Thread {
         try {
+            currentClip?.stop()
+            currentClip?.close()
+            
             val stream = AudioSystem.getAudioInputStream(ByteArrayInputStream(bytes))
             val clip = AudioSystem.getClip()
-            clip.open(stream); clip.start()
-        } catch (e: Exception) { e.printStackTrace() }
+            currentClip = clip
+            clip.open(stream)
+            val durationInSeconds = clip.microsecondLength / 1_000_000f
+            
+            // Reset state
+            onProgress(0f, durationInSeconds)
+            clip.start()
+            
+            while (clip.isActive || clip.isRunning) {
+                val currentInSeconds = clip.microsecondPosition / 1_000_000f
+                onProgress(currentInSeconds, durationInSeconds)
+                Thread.sleep(50) // Update every 50ms for a smooth progress bar
+            }
+            
+            onProgress(durationInSeconds, durationInSeconds)
+            onComplete()
+        } catch (e: Exception) { 
+            e.printStackTrace()
+            onComplete()
+        }
     }.start()
 }
 
@@ -95,12 +125,19 @@ fun Knob(
         val strokeWidth = 4.dp.toPx()
 
         drawArc(
-            color = Color(0xFF2A2A3A), startAngle = 135f, sweepAngle = 270f,
-            useCenter = false, style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+            color = Color(0xFF2A2A3A),
+            startAngle = 135f,
+            sweepAngle = 270f,
+            useCenter = false,
+            style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
         )
+
         drawArc(
-            color = color, startAngle = 135f, sweepAngle = 270f * dragAccumulator,
-            useCenter = false, style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+            color = color,
+            startAngle = 135f,
+            sweepAngle = 270f * dragAccumulator,
+            useCenter = false,
+            style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
         )
 
         val angleInRadians = (135f + 270f * dragAccumulator) * (Math.PI / 180f).toFloat()
@@ -116,7 +153,7 @@ fun Knob(
 fun LabeledKnob(label: String, value: Float, range: ClosedFloatingPointRange<Float>, onValueChange: (Float) -> Unit) {
     Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
         Text(label, color = Color.Gray, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-        Knob(value = value, range = range, onValueChange = onValueChange)
+        Knob(value, range, onValueChange)
         Text("%.1f".format(value), color = Color(0xFF42A5F5), fontSize = 10.sp)
     }
 }
@@ -135,22 +172,33 @@ fun App() {
     var sampleFile by remember { mutableStateOf<File?>(null) }
     var p by remember { mutableStateOf(FXParams()) }
     var status by remember { mutableStateOf("Ready to process") }
+    
+    var isPlaying by remember { mutableStateOf(false) }
+    var currentPos by remember { mutableStateOf(0f) }
+    var totalPos by remember { mutableStateOf(0f) }
+    
     val scope = rememberCoroutineScope()
 
     MaterialTheme(colors = darkColors()) {
         Surface(color = Color(0xFF0A0A0F), modifier = Modifier.fillMaxSize()) {
             Column(modifier = Modifier.padding(20.dp).verticalScroll(rememberScrollState())) {
-                Text("BASS MONSTER FX", fontSize = 22.sp, fontWeight = FontWeight.Black, color = Color.White)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                    Text("Cloud-Based Sound FX", fontSize = 22.sp, fontWeight = FontWeight.Black, color = Color.White)
+                    Button(onClick = {
+                        val chooser = JFileChooser().apply { fileFilter = FileNameExtensionFilter("Audio", "wav", "mp3") }
+                        if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) {
+                            sampleFile = chooser.selectedFile
+                            status = "Loaded: ${chooser.selectedFile.name}"
+                        }
+                    }) { Text("LOAD SAMPLE", fontSize = 11.sp) }
+                }
 
-                Button(modifier = Modifier.padding(vertical = 12.dp), onClick = {
-                    val chooser = JFileChooser().apply { fileFilter = FileNameExtensionFilter("Audio", "wav", "mp3") }
-                    if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) sampleFile = chooser.selectedFile
-                }) { Text("LOAD SAMPLE", fontSize = 11.sp) }
+                Spacer(Modifier.height(16.dp))
 
                 Section("8-BAND GRAPHIC EQ") {
-                    val freqs = listOf("40Hz", "80Hz", "160Hz", "320Hz", "640Hz", "1.2k", "2.5k", "5k")
+                    val f = listOf("40Hz", "80Hz", "160Hz", "320Hz", "640Hz", "1.2k", "2.5k", "5k")
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        freqs.forEachIndexed { i, label ->
+                        f.forEachIndexed { i, label ->
                             LabeledKnob(label, p.eq[i], -15f..15f) { v ->
                                 val newEq = p.eq.toMutableList(); newEq[i] = v; p = p.copy(eq = newEq)
                             }
@@ -160,32 +208,30 @@ fun App() {
 
                 Row(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.weight(1f).padding(end = 4.dp)) {
-                        Section("DYNAMICS & FUZZ") {
+                        Section("PITCH, FILTER & FUZZ") {
                             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                                LabeledKnob("Pitch", p.pitch, -12f..12f) { p = p.copy(pitch = it) }
+                                LabeledKnob("LP Filter", p.lpFilter, 200f..20000f) { p = p.copy(lpFilter = it) }
                                 LabeledKnob("Fuzz", p.fuzz, 0f..30f) { p = p.copy(fuzz = it) }
-                                LabeledKnob("Comp Th.", p.compThreshold, -40f..0f) { p = p.copy(compThreshold = it) }
-                                LabeledKnob("Ratio", p.compRatio, 1f..20f) { p = p.copy(compRatio = it) }
                             }
                         }
                     }
                     Column(modifier = Modifier.weight(1.2f).padding(start = 4.dp)) {
-                        Section("ECHO & AMBIENCE") {
+                        Section("AMBIENCE & CHORUS") {
                             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                                // Grouped Delay Controls
+                                LabeledKnob("Chorus", p.chorus, 0f..1f) { p = p.copy(chorus = it) }
                                 LabeledKnob("Dly Time", p.delayTime, 0.1f..1.5f) { p = p.copy(delayTime = it) }
-                                LabeledKnob("Dly Feed", p.delayFeed, 0f..0.9f) { p = p.copy(delayFeed = it) }
                                 LabeledKnob("Dly Mix", p.delayLevel, 0f..1f) { p = p.copy(delayLevel = it) }
                                 Divider(modifier = Modifier.width(1.dp).height(40.dp).align(Alignment.CenterVertically), color = Color.DarkGray)
-                                // Grouped Reverb Controls
                                 LabeledKnob("Rev Wet", p.reverbWet, 0f..1f) { p = p.copy(reverbWet = it) }
-                                LabeledKnob("Rev Room", p.reverbRoom, 0.1f..2.0f) { p = p.copy(reverbRoom = it) }
                             }
                         }
                     }
                 }
 
-                Section("MASTER OUTPUT") {
+                Section("DYNAMICS & MASTER") {
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                        LabeledKnob("Thresh", p.compThreshold, -40f..0f) { p = p.copy(compThreshold = it) }
                         LabeledKnob("Hard Clip", p.clip, -20f..0f) { p = p.copy(clip = it) }
                         LabeledKnob("Out Gain", p.master, -20f..20f) { p = p.copy(master = it) }
                     }
@@ -194,23 +240,82 @@ fun App() {
                 Spacer(Modifier.height(16.dp))
 
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Button(modifier = Modifier.weight(1f).height(45.dp), onClick = {
-                        val file = sampleFile ?: return@Button
-                        scope.launch { try { playWavBytes(fetchProcessedAudio(file, p)) } catch (e: Exception) { status = "Engine error: ${e.message}" } }
-                    }) { Text("PREVIEW") }
-
-                    Button(modifier = Modifier.weight(1f).height(45.dp), colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1B5E20)), onClick = {
-                        val file = sampleFile ?: return@Button
-                        val chooser = JFileChooser().apply { selectedFile = File("processed_${file.nameWithoutExtension}.wav") }
-                        if (chooser.showSaveDialog(null) == JFileChooser.APPROVE_OPTION) {
-                            scope.launch { try { Files.write(chooser.selectedFile.toPath(), fetchProcessedAudio(file, p)) } catch (e: Exception) {}}
+                    Button(
+                        modifier = Modifier.weight(1f).height(45.dp),
+                        onClick = {
+                            val file = sampleFile ?: return@Button
+                            status = "Processing in Cloud..."
+                            scope.launch {
+                                try {
+                                    val bytes = fetchProcessedAudio(file, p)
+                                    status = "Playing processed audio"
+                                    playWavBytes(
+                                        bytes, 
+                                        onProgress = { cur, tot -> 
+                                            currentPos = cur
+                                            totalPos = tot
+                                            isPlaying = true
+                                        },
+                                        onComplete = {
+                                            isPlaying = false
+                                            status = "Playback finished"
+                                        }
+                                    )
+                                } catch (e: Exception) {
+                                    status = "Engine error: ${e.message}"
+                                    isPlaying = false
+                                }
+                            }
                         }
-                    }) { Text("EXPORT WAV") }
+                    ) { Text("PREVIEW / PROCESS") }
+
+                    Button(
+                        modifier = Modifier.weight(1f).height(45.dp),
+                        colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1B5E20)),
+                        onClick = {
+                            val file = sampleFile ?: return@Button
+                            val chooser = JFileChooser().apply {
+                                selectedFile = File("processed_${file.nameWithoutExtension}.wav")
+                            }
+                            if (chooser.showSaveDialog(null) == JFileChooser.APPROVE_OPTION) {
+                                scope.launch {
+                                    try {
+                                        status = "Exporting..."
+                                        Files.write(chooser.selectedFile.toPath(), fetchProcessedAudio(file, p))
+                                        status = "Saved: ${chooser.selectedFile.name}"
+                                    } catch (e: Exception) {
+                                        status = "Save error: ${e.message}"
+                                    }
+                                }
+                            }
+                        }
+                    ) { Text("EXPORT WAV") }
                 }
-                Text(status, color = Color.DarkGray, fontSize = 10.sp, modifier = Modifier.padding(top = 8.dp))
+                
+                Row(modifier = Modifier.fillMaxWidth().padding(top = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(status, color = Color.Gray, fontSize = 12.sp)
+                        if (isPlaying || totalPos > 0) {
+                            Text(
+                                "Playing: %.2fs / %.2fs".format(currentPos, totalPos),
+                                color = Color(0xFF42A5F5),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                    if (isPlaying) {
+                        LinearProgressIndicator(
+                            progress = if (totalPos > 0) currentPos / totalPos else 0f,
+                            modifier = Modifier.weight(1f).height(8.dp),
+                            color = Color(0xFF42A5F5),
+                            backgroundColor = Color(0xFF2A2A3A)
+                        )
+                    }
+                }
             }
         }
     }
 }
 
-fun main() = application { Window(onCloseRequest = ::exitApplication, title = "Bass Monster FX", state = rememberWindowState(width = 850.dp, height = 750.dp)) { App() } }
+fun main() = application { Window(onCloseRequest = ::exitApplication, title = "Cloud-Based Sound FX", state = rememberWindowState(width = 850.dp, height = 750.dp)) { App() } }

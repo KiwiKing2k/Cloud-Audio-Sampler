@@ -11,16 +11,24 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.*
 import androidx.compose.ui.window.*
 import io.ktor.client.*
+import io.ktor.client.call.*
 import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.request.*
 import io.ktor.client.request.forms.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.ktor.serialization.kotlinx.json.*
 import kotlinx.coroutines.*
-import java.io.*
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.json.Json
+import java.io.File
+import java.io.ByteArrayInputStream
 import java.nio.file.Files
 import kotlin.math.cos
 import kotlin.math.sin
@@ -29,18 +37,35 @@ import javax.sound.sampled.Clip
 import javax.swing.JFileChooser
 import javax.swing.filechooser.FileNameExtensionFilter
 
-val httpClient = HttpClient(CIO)
+// 1. Configurare client HTTP cu suport JSON
+val httpClient = HttpClient(CIO) {
+    install(ContentNegotiation) {
+        json(Json {
+            ignoreUnknownKeys = true // Ignoră câmpurile de metadata din MongoDB (ex: _id)
+            prettyPrint = true
+            encodeDefaults = true
+        })
+    }
+}
 
+// 2. Model de date serializabil (oglindă cu modelul Python)
+@Serializable
 data class FXParams(
+    val name: String = "Untitled",
     val pitch: Float = 0f,
-    val lpFilter: Float = 20000f,
+    @SerialName("lp_filter") val lpFilter: Float = 20000f,
     val chorus: Float = 0f,
     val fuzz: Float = 0f,
     val eq: List<Float> = List(8) { 0f },
-    val compThreshold: Float = 0f, val compRatio: Float = 1f,
-    val delayFeed: Float = 0f, val delayTime: Float = 0.5f, val delayLevel: Float = 0f,
-    val reverbRoom: Float = 0.2f, val reverbWet: Float = 0f,
-    val clip: Float = 0f, val master: Float = 0f
+    @SerialName("comp_threshold") val compThreshold: Float = 0f,
+    @SerialName("comp_ratio") val compRatio: Float = 1f,
+    @SerialName("delay_feed") val delayFeed: Float = 0f,
+    @SerialName("delay_time") val delayTime: Float = 0.5f,
+    @SerialName("delay_level") val delayLevel: Float = 0f,
+    @SerialName("reverb_room") val reverbRoom: Float = 0.2f,
+    @SerialName("reverb_wet") val reverbWet: Float = 0f,
+    val clip: Float = 0f,
+    val master: Float = 0f
 )
 
 suspend fun fetchProcessedAudio(file: File, p: FXParams): ByteArray = withContext(Dispatchers.IO) {
@@ -50,10 +75,16 @@ suspend fun fetchProcessedAudio(file: File, p: FXParams): ByteArray = withContex
         parameter("chorus_depth", p.chorus)
         parameter("fuzz_drive", p.fuzz)
         p.eq.forEachIndexed { i, v -> parameter("eq_${listOf(40,80,160,320,640,1280,2560,5120)[i]}", v) }
-        parameter("comp_threshold", p.compThreshold); parameter("comp_ratio", p.compRatio)
-        parameter("delay_feedback", p.delayFeed); parameter("delay_time", p.delayTime); parameter("delay_level", p.delayLevel)
-        parameter("reverb_room", p.reverbRoom); parameter("reverb_wet", p.reverbWet)
-        parameter("clip_threshold", p.clip); parameter("master_gain", p.master)
+        parameter("comp_threshold", p.compThreshold)
+        parameter("comp_ratio", p.compRatio)
+        parameter("delay_feedback", p.delayFeed)
+        parameter("delay_time", p.delayTime)
+        parameter("delay_level", p.delayLevel)
+        parameter("reverb_room", p.reverbRoom)
+        parameter("reverb_wet", p.reverbWet)
+        parameter("clip_threshold", p.clip)
+        parameter("master_gain", p.master)
+
         setBody(MultiPartFormDataContent(formData {
             append("file", file.readBytes(), Headers.build {
                 append(HttpHeaders.ContentDisposition, "form-data; name=\"file\"; filename=\"${file.name}\"")
@@ -71,26 +102,25 @@ fun playWavBytes(bytes: ByteArray, onProgress: (Float, Float) -> Unit, onComplet
         try {
             currentClip?.stop()
             currentClip?.close()
-            
+
             val stream = AudioSystem.getAudioInputStream(ByteArrayInputStream(bytes))
             val clip = AudioSystem.getClip()
             currentClip = clip
             clip.open(stream)
             val durationInSeconds = clip.microsecondLength / 1_000_000f
-            
-            // Reset state
+
             onProgress(0f, durationInSeconds)
             clip.start()
-            
+
             while (clip.isActive || clip.isRunning) {
                 val currentInSeconds = clip.microsecondPosition / 1_000_000f
                 onProgress(currentInSeconds, durationInSeconds)
-                Thread.sleep(50) // Update every 50ms for a smooth progress bar
+                Thread.sleep(50)
             }
-            
+
             onProgress(durationInSeconds, durationInSeconds)
             onComplete()
-        } catch (e: Exception) { 
+        } catch (e: Exception) {
             e.printStackTrace()
             onComplete()
         }
@@ -172,11 +202,14 @@ fun App() {
     var sampleFile by remember { mutableStateOf<File?>(null) }
     var p by remember { mutableStateOf(FXParams()) }
     var status by remember { mutableStateOf("Ready to process") }
-    
+
+    var presetInputName by remember { mutableStateOf("New Preset") }
+    var cloudPresets by remember { mutableStateOf<List<FXParams>>(emptyList()) }
+
     var isPlaying by remember { mutableStateOf(false) }
     var currentPos by remember { mutableStateOf(0f) }
     var totalPos by remember { mutableStateOf(0f) }
-    
+
     val scope = rememberCoroutineScope()
 
     MaterialTheme(colors = darkColors()) {
@@ -194,6 +227,73 @@ fun App() {
                 }
 
                 Spacer(Modifier.height(16.dp))
+
+                Section("CLOUD PRESET MANAGEMENT") {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedTextField(
+                            value = presetInputName,
+                            onValueChange = { presetInputName = it },
+                            label = { Text("Preset Name", fontSize = 10.sp) },
+                            modifier = Modifier.weight(1f).height(54.dp),
+                            textStyle = TextStyle(fontSize = 12.sp, color = Color.White)
+                        )
+
+                        Button(
+                            modifier = Modifier.height(54.dp),
+                            onClick = {
+                                scope.launch {
+                                    try {
+                                        val toSave = p.copy(name = presetInputName)
+                                        val response: HttpResponse = httpClient.post("http://127.0.0.1:8000/presets/save") {
+                                            contentType(ContentType.Application.Json)
+                                            setBody(toSave)
+                                        }
+                                        if (response.status.isSuccess()) {
+                                            status = "Preset '$presetInputName' saved!"
+                                        } else {
+                                            status = "Error: ${response.status}"
+                                        }
+                                    } catch (e: Exception) {
+                                        status = "Save error: ${e.message}"
+                                    }
+                                }
+                            }
+                        ) { Text("SAVE", fontSize = 10.sp) }
+
+                        Button(
+                            modifier = Modifier.height(54.dp),
+                            colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF303F9F)),
+                            onClick = {
+                                scope.launch {
+                                    try {
+                                        val response: List<FXParams> = httpClient.get("http://127.0.0.1:8000/presets").body()
+                                        cloudPresets = response
+                                        status = "Synced ${response.size} presets"
+                                    } catch (e: Exception) {
+                                        status = "Sync error: ${e.message}"
+                                    }
+                                }
+                            }
+                        ) { Text("SYNC", fontSize = 10.sp) }
+                    }
+
+                    if (cloudPresets.isNotEmpty()) {
+                        Row(modifier = Modifier.padding(top = 8.dp).horizontalScroll(rememberScrollState())) {
+                            cloudPresets.forEach { remotePreset ->
+                                Card(
+                                    modifier = Modifier.padding(end = 8.dp).clickable {
+                                        p = remotePreset
+                                        presetInputName = remotePreset.name
+                                        status = "Loaded: ${remotePreset.name}"
+                                    },
+                                    backgroundColor = Color(0xFF2A2A3A)
+                                ) {
+                                    Text(remotePreset.name, modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp), fontSize = 11.sp, color = Color.Cyan)
+                                }
+                            }
+                        }
+                    }
+                }
 
                 Section("8-BAND GRAPHIC EQ") {
                     val f = listOf("40Hz", "80Hz", "160Hz", "320Hz", "640Hz", "1.2k", "2.5k", "5k")
@@ -250,8 +350,8 @@ fun App() {
                                     val bytes = fetchProcessedAudio(file, p)
                                     status = "Playing processed audio"
                                     playWavBytes(
-                                        bytes, 
-                                        onProgress = { cur, tot -> 
+                                        bytes,
+                                        onProgress = { cur, tot ->
                                             currentPos = cur
                                             totalPos = tot
                                             isPlaying = true
@@ -291,7 +391,7 @@ fun App() {
                         }
                     ) { Text("EXPORT WAV") }
                 }
-                
+
                 Row(modifier = Modifier.fillMaxWidth().padding(top = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(status, color = Color.Gray, fontSize = 12.sp)
@@ -318,4 +418,10 @@ fun App() {
     }
 }
 
-fun main() = application { Window(onCloseRequest = ::exitApplication, title = "Cloud-Based Sound FX", state = rememberWindowState(width = 850.dp, height = 750.dp)) { App() } }
+fun main() = application {
+    Window(
+        onCloseRequest = ::exitApplication,
+        title = "Cloud-Based Sound FX",
+        state = rememberWindowState(width = 850.dp, height = 820.dp)
+    ) { App() }
+}

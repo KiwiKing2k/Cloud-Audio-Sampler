@@ -3,6 +3,8 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     kotlin("jvm") version "2.1.0"
+    // adăugăm plugin-ul de serializare pentru a converti clasele în JSON
+    kotlin("plugin.serialization") version "2.1.0"
     id("org.jetbrains.compose") version "1.7.3"
     id("org.jetbrains.kotlin.plugin.compose") version "2.1.0"
 }
@@ -30,8 +32,14 @@ repositories {
 dependencies {
     implementation(compose.desktop.currentOs)
     implementation(compose.material)
+
+    // ktor core și engine-ul cio
     implementation("io.ktor:ktor-client-core:3.1.3")
     implementation("io.ktor:ktor-client-cio:3.1.3")
+
+    // adăugăm suport pentru negocierea conținutului și serializare json
+    implementation("io.ktor:ktor-client-content-negotiation:3.1.3")
+    implementation("io.ktor:ktor-serialization-kotlinx-json:3.1.3")
 }
 
 compose.desktop {

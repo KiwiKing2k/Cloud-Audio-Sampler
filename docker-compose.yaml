@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  # motorul de procesare audio
+  audio-engine:
+    build: ./audio-engine
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGO_URL=mongodb://database:27017
+    depends_on:
+      - database
+
+  # baza de date mongodb
+  database:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:

@@ -37,18 +37,8 @@ import javax.sound.sampled.Clip
 import javax.swing.JFileChooser
 import javax.swing.filechooser.FileNameExtensionFilter
 
-// 1. Configurare client HTTP cu suport JSON
-val httpClient = HttpClient(CIO) {
-    install(ContentNegotiation) {
-        json(Json {
-            ignoreUnknownKeys = true // Ignoră câmpurile de metadata din MongoDB (ex: _id)
-            prettyPrint = true
-            encodeDefaults = true
-        })
-    }
-}
+// --- MODELE DE DATE (Sincronizate cu Backend-ul Python) ---
 
-// 2. Model de date serializabil (oglindă cu modelul Python)
 @Serializable
 data class FXParams(
     val name: String = "Untitled",
@@ -68,13 +58,34 @@ data class FXParams(
     val master: Float = 0f
 )
 
-suspend fun fetchProcessedAudio(file: File, p: FXParams): ByteArray = withContext(Dispatchers.IO) {
+@Serializable
+data class ProcessResponse(
+    val status: String,
+    @SerialName("file_url") val fileUrl: String
+)
+
+// --- CONFIGURARE CLIENT HTTP ---
+
+val httpClient = HttpClient(CIO) {
+    install(ContentNegotiation) {
+        json(Json {
+            ignoreUnknownKeys = true
+            prettyPrint = true
+            encodeDefaults = true // Trimite toate câmpurile pentru a evita eroarea 422
+        })
+    }
+}
+
+// --- LOGICĂ DE PROCESARE ȘI DOWNLOAD (Arhitectură Distribuită) ---
+
+suspend fun processAndDownloadAudio(file: File, p: FXParams): ByteArray = withContext(Dispatchers.IO) {
+    // 1. Trimitem fișierul pentru procesare asincronă [cite: 132]
     val response: HttpResponse = httpClient.post("http://127.0.0.1:8000/process") {
         parameter("pitch_shift", p.pitch)
         parameter("lp_cutoff", p.lpFilter)
         parameter("chorus_depth", p.chorus)
         parameter("fuzz_drive", p.fuzz)
-        p.eq.forEachIndexed { i, v -> parameter("eq_${listOf(40,80,160,320,640,1280,2560,5120)[i]}", v) }
+        p.eq.forEachIndexed { i, v -> parameter("eq_${listOf(40, 80, 160, 320, 640, 1280, 2560, 5120)[i]}", v) }
         parameter("comp_threshold", p.compThreshold)
         parameter("comp_ratio", p.compRatio)
         parameter("delay_feedback", p.delayFeed)
@@ -92,8 +103,32 @@ suspend fun fetchProcessedAudio(file: File, p: FXParams): ByteArray = withContex
             })
         }))
     }
-    response.readRawBytes()
+
+    if (!response.status.isSuccess()) {
+        val errorBody = response.bodyAsText()
+        throw Exception("Server Error ${response.status}: $errorBody")
+    }
+
+    // 2. Extragem URL-ul din Object Storage (MinIO)
+    val result: ProcessResponse = response.body()
+
+    // Translatăm adresa din rețeaua Docker în Localhost pentru Windows
+    val accessibleUrl = result.fileUrl.replace("storage", "127.0.0.1")
+
+    // 3. Descărcăm fișierul audio final
+    val audioBytes: ByteArray = httpClient.get(accessibleUrl).body()
+
+    // VALIDARE CRITICĂ: Verificăm dacă fișierul este un WAV valid (începe cu RIFF)
+    val header = if (audioBytes.size > 4) String(audioBytes.take(4).toByteArray()) else ""
+    if (header != "RIFF") {
+        val errorContent = String(audioBytes.take(100).toByteArray())
+        throw Exception("MinIO Access Error! Conținutul primit nu este audio (probabil Access Denied XML): $errorContent")
+    }
+
+    return@withContext audioBytes
 }
+
+// --- REDARE AUDIO (Corectată) ---
 
 var currentClip: Clip? = null
 
@@ -107,25 +142,25 @@ fun playWavBytes(bytes: ByteArray, onProgress: (Float, Float) -> Unit, onComplet
             val clip = AudioSystem.getClip()
             currentClip = clip
             clip.open(stream)
-            val durationInSeconds = clip.microsecondLength / 1_000_000f
 
-            onProgress(0f, durationInSeconds)
+            val duration = clip.microsecondLength / 1_000_000f
+            onProgress(0f, duration)
             clip.start()
 
             while (clip.isActive || clip.isRunning) {
-                val currentInSeconds = clip.microsecondPosition / 1_000_000f
-                onProgress(currentInSeconds, durationInSeconds)
+                onProgress(clip.microsecondPosition / 1_000_000f, duration)
                 Thread.sleep(50)
             }
-
-            onProgress(durationInSeconds, durationInSeconds)
+            onProgress(duration, duration)
             onComplete()
         } catch (e: Exception) {
-            e.printStackTrace()
+            System.err.println("Audio Playback Error: ${e.message}")
             onComplete()
         }
     }.start()
 }
+
+// --- COMPONENTE UI (Minimalism Funcțional) [cite: 176, 180] ---
 
 @Composable
 fun Knob(
@@ -145,7 +180,7 @@ fun Knob(
     Canvas(modifier = modifier.pointerInput(Unit) {
         detectDragGestures { change, dragAmount ->
             change.consume()
-            val sensitivity = 0.003f
+            val sensitivity = 0.003f // Atenuare pentru precizie industrială [cite: 190]
             dragAccumulator = (dragAccumulator - dragAmount.y * sensitivity).coerceIn(0f, 1f)
             onValueChange(range.start + dragAccumulator * (range.endInclusive - range.start))
         }
@@ -156,26 +191,20 @@ fun Knob(
 
         drawArc(
             color = Color(0xFF2A2A3A),
-            startAngle = 135f,
-            sweepAngle = 270f,
-            useCenter = false,
+            startAngle = 135f, sweepAngle = 270f, useCenter = false,
             style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
         )
-
         drawArc(
             color = color,
-            startAngle = 135f,
-            sweepAngle = 270f * dragAccumulator,
-            useCenter = false,
+            startAngle = 135f, sweepAngle = 270f * dragAccumulator, useCenter = false,
             style = Stroke(width = strokeWidth, cap = StrokeCap.Round)
         )
 
-        val angleInRadians = (135f + 270f * dragAccumulator) * (Math.PI / 180f).toFloat()
-        val indicatorPos = Offset(
-            x = center.x + (radius - 4.dp.toPx()) * cos(angleInRadians),
-            y = center.y + (radius - 4.dp.toPx()) * sin(angleInRadians)
+        val angleRad = (135f + 270f * dragAccumulator) * (Math.PI / 180f).toFloat()
+        drawCircle(
+            color = Color.White, radius = 2.dp.toPx(),
+            center = Offset(center.x + (radius - 4.dp.toPx()) * cos(angleRad), center.y + (radius - 4.dp.toPx()) * sin(angleRad))
         )
-        drawCircle(color = Color.White, radius = 2.dp.toPx(), center = indicatorPos)
     }
 }
 
@@ -197,15 +226,15 @@ fun Section(title: String, content: @Composable ColumnScope.() -> Unit) {
     }
 }
 
+// --- APLICAȚIA PRINCIPALĂ ---
+
 @Composable
 fun App() {
     var sampleFile by remember { mutableStateOf<File?>(null) }
     var p by remember { mutableStateOf(FXParams()) }
-    var status by remember { mutableStateOf("Ready to process") }
-
+    var status by remember { mutableStateOf("Ready - Storage Integrated") }
     var presetInputName by remember { mutableStateOf("New Preset") }
     var cloudPresets by remember { mutableStateOf<List<FXParams>>(emptyList()) }
-
     var isPlaying by remember { mutableStateOf(false) }
     var currentPos by remember { mutableStateOf(0f) }
     var totalPos by remember { mutableStateOf(0f) }
@@ -237,58 +266,33 @@ fun App() {
                             modifier = Modifier.weight(1f).height(54.dp),
                             textStyle = TextStyle(fontSize = 12.sp, color = Color.White)
                         )
-
-                        Button(
-                            modifier = Modifier.height(54.dp),
-                            onClick = {
-                                scope.launch {
-                                    try {
-                                        val toSave = p.copy(name = presetInputName)
-                                        val response: HttpResponse = httpClient.post("http://127.0.0.1:8000/presets/save") {
-                                            contentType(ContentType.Application.Json)
-                                            setBody(toSave)
-                                        }
-                                        if (response.status.isSuccess()) {
-                                            status = "Preset '$presetInputName' saved!"
-                                        } else {
-                                            status = "Error: ${response.status}"
-                                        }
-                                    } catch (e: Exception) {
-                                        status = "Save error: ${e.message}"
+                        Button(modifier = Modifier.height(54.dp), onClick = {
+                            scope.launch {
+                                try {
+                                    val response: HttpResponse = httpClient.post("http://127.0.0.1:8000/presets/save") {
+                                        contentType(ContentType.Application.Json)
+                                        setBody(p.copy(name = presetInputName))
                                     }
-                                }
+                                    status = if (response.status.isSuccess()) "Preset saved to MongoDB" else "Save failed: ${response.status}"
+                                } catch (e: Exception) { status = "Error: ${e.message}" }
                             }
-                        ) { Text("SAVE", fontSize = 10.sp) }
+                        }) { Text("SAVE", fontSize = 10.sp) }
 
-                        Button(
-                            modifier = Modifier.height(54.dp),
-                            colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF303F9F)),
-                            onClick = {
-                                scope.launch {
-                                    try {
-                                        val response: List<FXParams> = httpClient.get("http://127.0.0.1:8000/presets").body()
-                                        cloudPresets = response
-                                        status = "Synced ${response.size} presets"
-                                    } catch (e: Exception) {
-                                        status = "Sync error: ${e.message}"
-                                    }
-                                }
+                        Button(modifier = Modifier.height(54.dp), colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF303F9F)), onClick = {
+                            scope.launch {
+                                try {
+                                    cloudPresets = httpClient.get("http://127.0.0.1:8000/presets").body()
+                                    status = "Synced ${cloudPresets.size} presets"
+                                } catch (e: Exception) { status = "Sync error: ${e.message}" }
                             }
-                        ) { Text("SYNC", fontSize = 10.sp) }
+                        }) { Text("SYNC", fontSize = 10.sp) }
                     }
 
                     if (cloudPresets.isNotEmpty()) {
                         Row(modifier = Modifier.padding(top = 8.dp).horizontalScroll(rememberScrollState())) {
-                            cloudPresets.forEach { remotePreset ->
-                                Card(
-                                    modifier = Modifier.padding(end = 8.dp).clickable {
-                                        p = remotePreset
-                                        presetInputName = remotePreset.name
-                                        status = "Loaded: ${remotePreset.name}"
-                                    },
-                                    backgroundColor = Color(0xFF2A2A3A)
-                                ) {
-                                    Text(remotePreset.name, modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp), fontSize = 11.sp, color = Color.Cyan)
+                            cloudPresets.forEach { remote ->
+                                Card(modifier = Modifier.padding(end = 8.dp).clickable { p = remote; presetInputName = remote.name }, backgroundColor = Color(0xFF2A2A3A)) {
+                                    Text(remote.name, modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp), fontSize = 11.sp, color = Color.Cyan)
                                 }
                             }
                         }
@@ -340,77 +344,42 @@ fun App() {
                 Spacer(Modifier.height(16.dp))
 
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Button(
-                        modifier = Modifier.weight(1f).height(45.dp),
-                        onClick = {
-                            val file = sampleFile ?: return@Button
-                            status = "Processing in Cloud..."
+                    Button(modifier = Modifier.weight(1f).height(45.dp), onClick = {
+                        val file = sampleFile ?: return@Button
+                        status = "Cloud Processing (S3 Integration)..."
+                        scope.launch {
+                            try {
+                                val bytes = processAndDownloadAudio(file, p)
+                                status = "Playing Wet Data from MinIO"
+                                playWavBytes(bytes, onProgress = { cur, tot -> currentPos = cur; totalPos = tot; isPlaying = true }, onComplete = { isPlaying = false; status = "Playback finished" })
+                            } catch (e: Exception) { status = "Engine error: ${e.message}"; isPlaying = false }
+                        }
+                    }) { Text("PREVIEW / PROCESS") }
+
+                    Button(modifier = Modifier.weight(1f).height(45.dp), colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1B5E20)), onClick = {
+                        val file = sampleFile ?: return@Button
+                        val chooser = JFileChooser().apply { selectedFile = File("processed_${file.nameWithoutExtension}.wav") }
+                        if (chooser.showSaveDialog(null) == JFileChooser.APPROVE_OPTION) {
                             scope.launch {
                                 try {
-                                    val bytes = fetchProcessedAudio(file, p)
-                                    status = "Playing processed audio"
-                                    playWavBytes(
-                                        bytes,
-                                        onProgress = { cur, tot ->
-                                            currentPos = cur
-                                            totalPos = tot
-                                            isPlaying = true
-                                        },
-                                        onComplete = {
-                                            isPlaying = false
-                                            status = "Playback finished"
-                                        }
-                                    )
-                                } catch (e: Exception) {
-                                    status = "Engine error: ${e.message}"
-                                    isPlaying = false
-                                }
+                                    status = "Exporting from Cloud..."
+                                    Files.write(chooser.selectedFile.toPath(), processAndDownloadAudio(file, p))
+                                    status = "Saved: ${chooser.selectedFile.name}"
+                                } catch (e: Exception) { status = "Save error: ${e.message}" }
                             }
                         }
-                    ) { Text("PREVIEW / PROCESS") }
-
-                    Button(
-                        modifier = Modifier.weight(1f).height(45.dp),
-                        colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1B5E20)),
-                        onClick = {
-                            val file = sampleFile ?: return@Button
-                            val chooser = JFileChooser().apply {
-                                selectedFile = File("processed_${file.nameWithoutExtension}.wav")
-                            }
-                            if (chooser.showSaveDialog(null) == JFileChooser.APPROVE_OPTION) {
-                                scope.launch {
-                                    try {
-                                        status = "Exporting..."
-                                        Files.write(chooser.selectedFile.toPath(), fetchProcessedAudio(file, p))
-                                        status = "Saved: ${chooser.selectedFile.name}"
-                                    } catch (e: Exception) {
-                                        status = "Save error: ${e.message}"
-                                    }
-                                }
-                            }
-                        }
-                    ) { Text("EXPORT WAV") }
+                    }) { Text("EXPORT WAV") }
                 }
 
                 Row(modifier = Modifier.fillMaxWidth().padding(top = 16.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(status, color = Color.Gray, fontSize = 12.sp)
                         if (isPlaying || totalPos > 0) {
-                            Text(
-                                "Playing: %.2fs / %.2fs".format(currentPos, totalPos),
-                                color = Color(0xFF42A5F5),
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold
-                            )
+                            Text("Playing: %.2fs / %.2fs".format(currentPos, totalPos), color = Color(0xFF42A5F5), fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
                     }
                     if (isPlaying) {
-                        LinearProgressIndicator(
-                            progress = if (totalPos > 0) currentPos / totalPos else 0f,
-                            modifier = Modifier.weight(1f).height(8.dp),
-                            color = Color(0xFF42A5F5),
-                            backgroundColor = Color(0xFF2A2A3A)
-                        )
+                        LinearProgressIndicator(progress = if (totalPos > 0) currentPos / totalPos else 0f, modifier = Modifier.weight(1f).height(8.dp), color = Color(0xFF42A5F5), backgroundColor = Color(0xFF2A2A3A))
                     }
                 }
             }
@@ -418,10 +387,4 @@ fun App() {
     }
 }
 
-fun main() = application {
-    Window(
-        onCloseRequest = ::exitApplication,
-        title = "Cloud-Based Sound FX",
-        state = rememberWindowState(width = 850.dp, height = 820.dp)
-    ) { App() }
-}
+fun main() = application { Window(onCloseRequest = ::exitApplication, title = "Cloud-Based Sound FX", state = rememberWindowState(width = 850.dp, height = 820.dp)) { App() } }

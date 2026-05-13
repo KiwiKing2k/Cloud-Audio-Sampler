@@ -22,7 +22,7 @@ async def validation_exception_handler(request, exc):
     print("eroare de validare detectata:", json.dumps(error_details, indent=2))
     return JSONResponse(status_code=422, content={"detail": error_details})
 
-# configurare stocare obiecte s3/minio [cite: 172]
+# configurare stocare obiecte s3/minio
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://storage:9000")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "admin")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "password123")
@@ -30,7 +30,7 @@ BUCKET_NAME = "processed-audio"
 
 session = aioboto3.Session()
 
-# configurare baza de date mongodb [cite: 158]
+# configurare baza de date mongodb
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://database:27017")
 client = AsyncIOMotorClient(MONGO_URL)
 db = client.sound_fx_db
@@ -96,7 +96,7 @@ async def process_audio(
         sample_rate = f.samplerate
         audio_in = f.read(f.frames)
 
-    # algoritm de tail padding dinamic bazat pe dimensiunea camerei [cite: 119, 122, 142]
+    # algoritm de tail padding dinamic bazat pe dimensiunea camerei
     # durata cozii in secunde: $1.5 + (reverb\_room \cdot 3.0)$
     tail_duration = 1.5 + (reverb_room * 3.0)
     padding_samples = int(sample_rate * tail_duration)
@@ -128,7 +128,7 @@ async def process_audio(
     sf.write(buf, audio_out.T, sample_rate, format="WAV", subtype="PCM_16")
     buf.seek(0)
 
-    # stocare rezultat in cloud si returnare url [cite: 173]
+    # stocare rezultat in cloud si returnare url
     file_id = f"{uuid.uuid4()}.wav"
     async with session.client("s3", endpoint_url=S3_ENDPOINT,
                               aws_access_key_id=S3_ACCESS_KEY,

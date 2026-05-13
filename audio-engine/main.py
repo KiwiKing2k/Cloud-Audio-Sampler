@@ -135,7 +135,7 @@ async def process_audio(
                               aws_secret_access_key=S3_SECRET_KEY) as s3:
         await s3.upload_fileobj(buf, BUCKET_NAME, file_id)
 
-    return {"status": "processed", "file_url": f"{S3_ENDPOINT}/{BUCKET_NAME}/{file_id}"} # cite: 149
+    return {"status": "processed", "file_url": f"{S3_ENDPOINT}/{BUCKET_NAME}/{file_id}"}
 
 @app.post("/presets/save")
 async def save_preset(preset: Preset):
